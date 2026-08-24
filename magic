@@ -159,6 +159,9 @@ def set_idle_timeouts(screen_off_ms: int | None, suspend_ac_ms: int | None):
 
 
 def idle_status_text() -> str:
+    path = os.path.join(IDLE_CONFIG_DIR, "screen_off_time")
+    if not os.path.exists(path):
+        return "Using COSMIC default (never set here)"
     ms = _read_idle_key("screen_off_time")
     if ms is None:
         return "Disabled"

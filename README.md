@@ -36,8 +36,13 @@ COSMIC-based distros with the same component names. Porting to a different
 desktop environment would require replacing the idle/lock config path (see
 "How idle timeouts work" below) with whatever that DE uses.
 
-**Packages**:
-- `python3`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` (GTK4 + libadwaita — required)
+**Your user must already be able to `sudo`** (in the `sudo`/`wheel` group).
+`install.sh` checks for this up front and refuses to proceed otherwise —
+it doesn't grant sudo access, only a narrower rule for an existing admin.
+
+**Packages** (Debian/Ubuntu apt names — `install.sh` checks these and tells
+you exactly what's missing):
+- `python3`, `python3-gi`, `gir1.2-gtk-4.0`, `gir1.2-adw-1` (required)
 - `gir1.2-secret-1` (GNOME Keyring bindings — optional, only needed for
   Sunshine pairing/credentials; everything else works without it)
 - `network-manager`, `ethtool`, `systemd`, `sudo`
@@ -140,6 +145,11 @@ approach) does nothing. The real, live-reloaded config lives at
 from its source), storing milliseconds as RON `Some(N)` / `None`. Magic
 writes these directly, so there's never a mismatch between what Magic shows
 and what System Settings shows.
+
+On a fresh install, before you've toggled Home/Away or saved Preferences
+even once, these files may not exist yet — COSMIC then falls back to its
+own built-in default (~15 min) rather than "disabled." Magic's status row
+shows "Using COSMIC default" in that case, not "Disabled".
 
 ## Uninstall
 

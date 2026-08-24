@@ -16,10 +16,32 @@ ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 HELPER=/usr/local/libexec/magic-helper
 SUDOERS_FILE=/etc/sudoers.d/magic
 
+echo "== Checking environment =="
+case "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}" in
+    *[Cc][Oo][Ss][Mm][Ii][Cc]*) ;;
+    *)
+        echo "  Warning: this doesn't look like a COSMIC session"
+        echo "  (XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-<unset>}). The idle/lock"
+        echo "  timeout feature writes to a COSMIC-specific config path and will"
+        echo "  silently do nothing on GNOME/KDE/etc — everything else (sleep"
+        echo "  masking, Wake-on-LAN) is DE-independent and will still work."
+        ;;
+esac
+
+if ! sudo -v 2>/dev/null; then
+    echo "  Error: '$USER' cannot sudo on this machine. install.sh needs sudo for" >&2
+    echo "  two steps (installing the root helper and its sudoers rule) — add" >&2
+    echo "  this user to the sudo/wheel group first, then re-run." >&2
+    exit 1
+fi
+
 echo "== Checking dependencies =="
 missing=()
-python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1')" 2>/dev/null \
-    || missing+=("gir1.2-gtk-4.0 / gir1.2-adw-1 (GTK4 + libadwaita GObject bindings)")
+python3 -c "import gi" 2>/dev/null || missing+=("python3-gi")
+python3 -c "import gi; gi.require_version('Gtk','4.0')" 2>/dev/null \
+    || missing+=("gir1.2-gtk-4.0")
+python3 -c "import gi; gi.require_version('Adw','1')" 2>/dev/null \
+    || missing+=("gir1.2-adw-1")
 command -v nmcli >/dev/null || missing+=("network-manager")
 command -v ethtool >/dev/null || missing+=("ethtool")
 command -v systemctl >/dev/null || missing+=("systemd")
@@ -27,9 +49,9 @@ python3 -c "import gi; gi.require_version('Secret','1')" 2>/dev/null \
     || echo "  Note: gir1.2-secret-1 not found — Sunshine pairing/keyring features will be" \
             "disabled until you 'sudo apt install gir1.2-secret-1' (everything else works)."
 if [ "${#missing[@]}" -gt 0 ]; then
-    echo "Missing required packages:"
+    echo "Missing required packages (Debian/Ubuntu apt names):"
     printf '  - %s\n' "${missing[@]}"
-    echo "Install them (Debian/Ubuntu-based) and re-run this script."
+    echo "Install them and re-run this script."
     exit 1
 fi
 
