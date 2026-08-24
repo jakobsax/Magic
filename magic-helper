@@ -1,0 +1,41 @@
+#!/bin/bash
+# Privileged Magic helper. Invoked via a scoped passwordless sudo rule
+# (/etc/sudoers.d/magic) for the current user only. Takes exactly one
+# fixed argument - no user-supplied unit/connection names ever reach
+# this script.
+set -euo pipefail
+
+# --- EDIT THESE TWO LINES FOR YOUR HARDWARE ---------------------------
+# CONN must match the exact NetworkManager connection name for your
+# wired interface: `nmcli -t -f NAME,DEVICE connection show`
+# IFACE must match your wired interface name: `ip -o link show | cut -d: -f2`
+CONN="Wired connection 1"
+IFACE="eno1"
+# ------------------------------------------------------------------------
+
+UNITS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
+
+apply_wol() {
+    nmcli connection modify "$CONN" 802-3-ethernet.wake-on-lan "$1"
+    nmcli device reapply "$IFACE" >/dev/null 2>&1 || nmcli connection up "$CONN" >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+    away)
+        systemctl mask "${UNITS[@]}"
+        apply_wol magic
+        ;;
+    home)
+        systemctl unmask "${UNITS[@]}"
+        apply_wol default
+        ;;
+    uninstall)
+        systemctl unmask "${UNITS[@]}"
+        apply_wol default
+        rm -f /usr/local/libexec/magic-helper
+        ;;
+    *)
+        echo "Usage: magic-helper {away|home|uninstall}" >&2
+        exit 1
+        ;;
+esac

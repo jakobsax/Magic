@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""Magic — toggle between Home and Away power states.
+
+Home:  normal ACPI sleep, cosmic-idle screen lock (per your Preferences
+       timeouts), Wake-on-LAN off.
+Away:  sleep/hibernate masked (stays in S0 for Tailscale + Sunshine),
+       cosmic-idle timeouts disabled, Wake-on-LAN armed on eno1.
+
+cosmic-idle is spawned directly by cosmic-session, not through its
+systemd unit, so idle behavior is controlled by writing COSMIC's own
+config at ~/.config/cosmic/com.system76.CosmicIdle/v1/* — the exact
+same files cosmic-settings' Power panel edits, so there's no separate
+"Magic state" that can drift from what System Settings shows.
+
+While this window is open it polls local state every few seconds and,
+if Away Mode is active and the eno1 cable is pulled, reverts to Home
+Mode automatically (WoL needs the cable, so there's no reason to keep
+sleep disabled without it). Nothing runs when the window is closed.
+"""
+import base64
+import http.client
+import json
+import os
+import re
+import ssl
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+try:
+    gi.require_version("Secret", "1")
+    from gi.repository import Secret  # noqa: E402
+
+    HAVE_SECRET = True
+except (ValueError, ImportError):
+    HAVE_SECRET = False
+
+APP_ID = "com.jakobsax.Magic"
+# Must match magic-helper's IFACE/CONN exactly — see the comment there.
+IFACE = "eno1"
+CONN = "Wired connection 1"
+HELPER = "/usr/local/libexec/magic-helper"
+POLL_SECONDS = 4
+
+STATE_DIR = os.path.expanduser("~/.config/magic")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+DEFAULT_STATE = {
+    "home_screen_off_min": 10,
+    "home_suspend_min": 15,
+    "last_device_name": "",
+    "sunshine_host": "localhost",
+    "sunshine_port": 47990,
+}
+
+IDLE_CONFIG_DIR = os.path.expanduser("~/.config/cosmic/com.system76.CosmicIdle/v1")
+
+if HAVE_SECRET:
+    SUNSHINE_SCHEMA = Secret.Schema.new(
+        "com.jakobsax.Magic.Sunshine",
+        Secret.SchemaFlags.NONE,
+        {"service": Secret.SchemaAttributeType.STRING},
+    )
+
+
+def run(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def is_away_mode() -> bool:
+    return run(["systemctl", "is-enabled", "sleep.target"]).stdout.strip() == "masked"
+
+
+def eno1_carrier() -> bool:
+    try:
+        with open(f"/sys/class/net/{IFACE}/carrier") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def eno1_wol_state() -> str:
+    out = run(["ethtool", IFACE]).stdout
+    for line in out.splitlines():
+        if "Wake-on" in line:
+            val = line.split(":")[-1].strip()
+            return "Armed (magic packet)" if val == "g" else "Off"
+    # This driver doesn't report live Wake-on state to ethtool without
+    # root, so fall back to the NetworkManager profile value — it's what
+    # Magic itself sets, so it's accurate as long as nothing else changed it.
+    r = run(["nmcli", "-t", "-f", "802-3-ethernet.wake-on-lan", "connection", "show", CONN])
+    val = r.stdout.strip().rsplit(":", 1)[-1] if r.returncode == 0 else ""
+    if val == "magic":
+        return "Armed (magic packet)"
+    if val:
+        return "Off"
+    return "Unknown"
+
+
+def tailscale_state() -> str:
+    r = run(["tailscale", "status", "--json"])
+    if r.returncode != 0:
+        return "Not running"
+    try:
+        backend = json.loads(r.stdout).get("BackendState", "Unknown")
+    except (json.JSONDecodeError, AttributeError):
+        return "Unknown"
+    return {"Running": "Connected", "Stopped": "Stopped"}.get(backend, backend)
+
+
+# -- Magic's own preferences (idle timeouts, last-used pairing name) --------
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    return {**DEFAULT_STATE, **data}
+
+
+def save_state(state: dict):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# -- COSMIC idle config (same files cosmic-settings' Power panel writes) ----
+
+
+def _write_idle_key(name: str, ms: int | None):
+    os.makedirs(IDLE_CONFIG_DIR, exist_ok=True)
+    value = "None" if ms is None else f"Some({ms})"
+    with open(os.path.join(IDLE_CONFIG_DIR, name), "w") as f:
+        f.write(value)
+
+
+def _read_idle_key(name: str) -> int | None:
+    try:
+        with open(os.path.join(IDLE_CONFIG_DIR, name)) as f:
+            content = f.read().strip()
+    except OSError:
+        return None
+    m = re.match(r"Some\((\d+)\)", content)
+    return int(m.group(1)) if m else None
+
+
+def set_idle_timeouts(screen_off_ms: int | None, suspend_ac_ms: int | None):
+    _write_idle_key("screen_off_time", screen_off_ms)
+    _write_idle_key("suspend_on_ac_time", suspend_ac_ms)
+
+
+def idle_status_text() -> str:
+    ms = _read_idle_key("screen_off_time")
+    if ms is None:
+        return "Disabled"
+    return f"Lock after {ms // 60000} min"
+
+
+# -- Sunshine web UI credentials (GNOME Keyring via libsecret) --------------
+
+
+def get_sunshine_credentials():
+    if not HAVE_SECRET:
+        return None
+    value = Secret.password_lookup_sync(SUNSHINE_SCHEMA, {"service": "sunshine-webui"}, None)
+    if not value:
+        return None
+    try:
+        data = json.loads(value)
+        return data["username"], data["password"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def set_sunshine_credentials(username: str, password: str) -> bool:
+    if not HAVE_SECRET:
+        return False
+    payload = json.dumps({"username": username, "password": password})
+    return Secret.password_store_sync(
+        SUNSHINE_SCHEMA,
+        {"service": "sunshine-webui"},
+        Secret.COLLECTION_DEFAULT,
+        "Magic — Sunshine Web UI Credentials",
+        payload,
+        None,
+    )
+
+
+def sunshine_pair(host: str, port: int, name: str, pin: str, username: str, password: str):
+    """Returns (ok, message). Runs on a background thread."""
+    body = json.dumps({"name": name, "pin": pin}).encode()
+    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+    headers = {"Content-Type": "application/json", "Authorization": f"Basic {auth}"}
+    ctx = ssl._create_unverified_context()  # Sunshine's cert is self-signed, localhost-only
+    try:
+        conn = http.client.HTTPSConnection(host, port, timeout=10, context=ctx)
+        conn.request("POST", "/api/pin", body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read().decode(errors="replace")
+        conn.close()
+    except OSError as e:
+        return False, f"Couldn't reach Sunshine at {host}:{port} ({e})"
+    if resp.status == 401:
+        return False, "Sunshine rejected the username/password. Update them via the menu."
+    if resp.status != 200:
+        return False, f"Sunshine returned HTTP {resp.status}: {raw}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return False, f"Unexpected response from Sunshine: {raw}"
+    if data.get("status"):
+        return True, "Paired successfully."
+    return False, (
+        "Sunshine rejected the PIN — make sure Moonlight is showing the "
+        "pairing screen right now."
+    )
+
+
+class MagicWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Magic")
+        self.set_default_size(440, 780)
+        self._syncing = False
+        self._applying = False
+        self.state = load_state()
+
+        toolbar_view = Adw.ToolbarView()
+        self.set_content(toolbar_view)
+
+        header = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header)
+
+        menu = Gio.Menu()
+        section1 = Gio.Menu()
+        section1.append("Preferences…", "app.preferences")
+        section1.append("Sunshine Credentials…", "app.sunshine_credentials")
+        menu.append_section(None, section1)
+        section2 = Gio.Menu()
+        section2.append("Help", "app.help")
+        section2.append("About Magic", "app.about")
+        menu.append_section(None, section2)
+        section3 = Gio.Menu()
+        section3.append("Uninstall Magic…", "app.uninstall")
+        menu.append_section(None, section3)
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu)
+        header.pack_end(menu_button)
+
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        toolbar_view.set_content(scroller)
+
+        clamp = Adw.Clamp(margin_top=24, margin_bottom=24, margin_start=18, margin_end=18)
+        scroller.set_child(clamp)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        clamp.set_child(box)
+
+        icon = Gtk.Image.new_from_icon_name("magic")
+        icon.set_pixel_size(64)
+        box.append(icon)
+
+        mode_group = Adw.PreferencesGroup()
+        box.append(mode_group)
+
+        self.switch_row = Adw.SwitchRow(
+            title="Away Mode",
+            subtitle="Block sleep and lock, arm Wake-on-LAN",
+        )
+        self.switch_row.connect("notify::active", self._on_switch_toggled)
+        mode_group.add(self.switch_row)
+
+        self.status_group = Adw.PreferencesGroup(title="Status")
+        box.append(self.status_group)
+
+        self.row_eth = Adw.ActionRow(title="Ethernet (eno1)")
+        self.row_wol = Adw.ActionRow(title="Wake-on-LAN")
+        self.row_sleep = Adw.ActionRow(title="Sleep and Lock")
+        self.row_ts = Adw.ActionRow(title="Tailscale")
+        for row in (self.row_eth, self.row_wol, self.row_sleep, self.row_ts):
+            row.value_label = Gtk.Label(css_classes=["dim-label"])
+            row.add_suffix(row.value_label)
+            self.status_group.add(row)
+
+        pair_group = Adw.PreferencesGroup(
+            title="Sunshine Pairing",
+            description="Enter the PIN Moonlight shows on the new device.",
+        )
+        box.append(pair_group)
+
+        self.device_name_row = Adw.EntryRow(title="Device Name")
+        self.device_name_row.set_text(self.state["last_device_name"])
+        pair_group.add(self.device_name_row)
+
+        self.pin_row = Adw.EntryRow(title="PIN")
+        pair_group.add(self.pin_row)
+
+        pair_button = Gtk.Button(
+            label="Pair Device", css_classes=["suggested-action"], margin_top=4
+        )
+        pair_button.connect("clicked", self._on_pair_clicked)
+        pair_group.add(pair_button)
+
+        self.refresh_status()
+        self._sync_switch_to_reality()
+        GLib.timeout_add_seconds(POLL_SECONDS, self._on_poll)
+
+    # -- state application -------------------------------------------------
+
+    def apply_mode_async(self, away: bool, on_done):
+        """Runs the helper via a scoped passwordless sudo rule, on a
+        background thread so the window never freezes. (Not pkexec —
+        cosmic-osd's polkit agent has a bug that dismisses every polkit
+        auth request on this system, so elevation goes through sudo -n
+        instead, which doesn't touch that agent at all.)"""
+
+        def worker():
+            error = None
+            action = "away" if away else "home"
+            r = run(["sudo", "-n", HELPER, action], timeout=15)
+            if r.returncode != 0:
+                error = RuntimeError(
+                    r.stderr.strip()
+                    or "sudo -n failed — has magic-setup-sudoers.sh been run?"
+                )
+            else:
+                if away:
+                    set_idle_timeouts(None, None)
+                else:
+                    state = load_state()
+                    set_idle_timeouts(
+                        state["home_screen_off_min"] * 60_000,
+                        state["home_suspend_min"] * 60_000,
+                    )
+            GLib.idle_add(on_done, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def notify_system(self, title: str, body: str):
+        n = Gio.Notification.new(title)
+        n.set_body(body)
+        self.get_application().send_notification(None, n)
+
+    # -- switch handling -----------------------------------------------------
+
+    def _sync_switch_to_reality(self):
+        self._syncing = True
+        self.switch_row.set_active(is_away_mode())
+        self._syncing = False
+
+    def _set_switch_silently(self, value: bool):
+        self._syncing = True
+        self.switch_row.set_active(value)
+        self._syncing = False
+
+    def _on_switch_toggled(self, row, _pspec):
+        if self._syncing:
+            return
+        wants_away = row.get_active()
+        if wants_away:
+            if not eno1_carrier():
+                self._set_switch_silently(False)
+                self._warn_no_ethernet()
+                return
+            self._confirm_away_mode()
+        else:
+            self._commit(False)
+
+    def _warn_no_ethernet(self):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Ethernet not detected",
+            body=(
+                "Away Mode arms Wake-on-LAN on eno1, but no cable is plugged "
+                "in right now. Plug in Ethernet and try again."
+            ),
+        )
+        dialog.add_response("ok", "OK")
+        dialog.present()
+
+    def _confirm_away_mode(self):
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading="Enable Away Mode?",
+            body=(
+                "This system will no longer sleep, suspend, hibernate, or "
+                "lock its screen while Away Mode is on — it stays fully "
+                "awake so Tailscale and Sunshine keep working remotely. "
+                "Wake-on-LAN will be armed on eno1.\n\n"
+                "If the Ethernet cable is unplugged later, Magic will "
+                "revert to Home Mode automatically."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("enable", "Enable Away Mode")
+        dialog.set_response_appearance("enable", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+        dialog.connect("response", self._on_confirm_response)
+        dialog.present()
+
+    def _on_confirm_response(self, dialog, response):
+        if response == "enable":
+            self._commit(True)
+        else:
+            self._set_switch_silently(False)
+
+    def _commit(self, away: bool):
+        if self._applying:
+            return
+        self._applying = True
+        self.switch_row.set_sensitive(False)
+        self.switch_row.set_subtitle("Applying…")
+
+        def done(error):
+            self._applying = False
+            self.switch_row.set_sensitive(True)
+            self.switch_row.set_subtitle("Block sleep and lock, arm Wake-on-LAN")
+            if error is not None:
+                self._set_switch_silently(not away)
+                self._error(str(error))
+                return False
+            self._set_switch_silently(away)
+            label = "Away Mode enabled" if away else "Home Mode restored"
+            detail = (
+                "Sleep, hibernate, and screen lock are disabled; Wake-on-LAN is armed."
+                if away
+                else "Normal sleep, suspend, and screen lock are back in effect."
+            )
+            self.notify_system(f"Magic — {label}", detail)
+            self.refresh_status()
+            return False
+
+        self.apply_mode_async(away, done)
+
+    def _error(self, message: str, heading: str = "Magic couldn't apply that change"):
+        dialog = Adw.MessageDialog(transient_for=self, heading=heading, body=message)
+        dialog.add_response("ok", "OK")
+        dialog.present()
+
+    # -- polling / status ----------------------------------------------------
+
+    def _on_poll(self):
+        away = is_away_mode()
+        carrier = eno1_carrier()
+        if away and not carrier and not self._applying:
+            self._auto_revert_home()
+        self.refresh_status()
+        return True
+
+    def _auto_revert_home(self):
+        self._applying = True
+        self.switch_row.set_sensitive(False)
+
+        def done(error):
+            self._applying = False
+            self.switch_row.set_sensitive(True)
+            if error is not None:
+                self.notify_system("Magic — auto-revert failed", str(error))
+                return False
+            self._set_switch_silently(False)
+            self.notify_system(
+                "Magic — Ethernet unplugged",
+                "Away Mode needs eno1 connected for Wake-on-LAN, so Magic switched "
+                "back to Home Mode automatically.",
+            )
+            return False
+
+        self.apply_mode_async(False, done)
+
+    def refresh_status(self):
+        carrier = eno1_carrier()
+        self.row_eth.value_label.set_label("Connected" if carrier else "Disconnected")
+        self.row_wol.value_label.set_label(eno1_wol_state())
+        self.row_sleep.value_label.set_label(
+            "Disabled (Away Mode)" if is_away_mode() else idle_status_text()
+        )
+        self.row_ts.value_label.set_label(tailscale_state())
+
+    # -- Sunshine pairing -----------------------------------------------------
+
+    def _on_pair_clicked(self, _button):
+        name = self.device_name_row.get_text().strip()
+        pin = self.pin_row.get_text().strip()
+        if not name:
+            self._error("Enter a device name first.", heading="Missing device name")
+            return
+        if not (pin.isdigit() and len(pin) == 4):
+            self._error(
+                "PIN must be exactly 4 digits, as shown on the device you're pairing.",
+                heading="Invalid PIN",
+            )
+            return
+
+        creds = get_sunshine_credentials()
+        if creds is None:
+            if not HAVE_SECRET:
+                self._error(
+                    "GNOME Keyring support isn't installed yet. Run:\n\n"
+                    "sudo apt install gir1.2-secret-1\n\n"
+                    "then restart Magic.",
+                    heading="Keyring unavailable",
+                )
+            else:
+                self._error(
+                    "Set your Sunshine web UI username/password first via the "
+                    "menu → Sunshine Credentials…",
+                    heading="No Sunshine credentials saved",
+                )
+            return
+
+        username, password = creds
+        host = self.state["sunshine_host"]
+        port = self.state["sunshine_port"]
+        threading.Thread(
+            target=self._pair_worker,
+            args=(host, port, name, pin, username, password),
+            daemon=True,
+        ).start()
+
+    def _pair_worker(self, host, port, name, pin, username, password):
+        ok, message = sunshine_pair(host, port, name, pin, username, password)
+        GLib.idle_add(self._on_pair_result, ok, message, name)
+
+    def _on_pair_result(self, ok: bool, message: str, name: str):
+        if ok:
+            self.state["last_device_name"] = name
+            save_state(self.state)
+            self.pin_row.set_text("")
+            self.notify_system("Magic — Sunshine paired", f"{name} is now paired.")
+        else:
+            self._error(message, heading="Pairing failed")
+        return False
+
+    # -- Preferences / credentials dialogs ------------------------------------
+
+    def open_preferences(self):
+        dialog = Adw.PreferencesDialog(title="Preferences")
+        page = Adw.PreferencesPage()
+        dialog.add(page)
+        group = Adw.PreferencesGroup(
+            title="Home Mode Idle Timeouts",
+            description="Written to the same COSMIC config cosmic-settings' Power panel uses.",
+        )
+        page.add(group)
+
+        screen_off_row = Adw.SpinRow.new_with_range(1, 120, 1)
+        screen_off_row.set_title("Screen off / lock after (minutes)")
+        screen_off_row.set_value(self.state["home_screen_off_min"])
+        group.add(screen_off_row)
+
+        suspend_row = Adw.SpinRow.new_with_range(1, 240, 1)
+        suspend_row.set_title("Suspend after (minutes)")
+        suspend_row.set_value(self.state["home_suspend_min"])
+        group.add(suspend_row)
+
+        sunshine_group = Adw.PreferencesGroup(
+            title="Sunshine API",
+            description="Where Magic sends pairing requests.",
+        )
+        page.add(sunshine_group)
+
+        host_row = Adw.EntryRow(title="Host")
+        host_row.set_text(self.state["sunshine_host"])
+        sunshine_group.add(host_row)
+
+        port_row = Adw.SpinRow.new_with_range(1, 65535, 1)
+        port_row.set_title("Port")
+        port_row.set_value(self.state["sunshine_port"])
+        sunshine_group.add(port_row)
+
+        def on_close(*_args):
+            self.state["home_screen_off_min"] = int(screen_off_row.get_value())
+            self.state["home_suspend_min"] = int(suspend_row.get_value())
+            self.state["sunshine_host"] = host_row.get_text().strip() or "localhost"
+            self.state["sunshine_port"] = int(port_row.get_value())
+            save_state(self.state)
+            if not is_away_mode():
+                set_idle_timeouts(
+                    self.state["home_screen_off_min"] * 60_000,
+                    self.state["home_suspend_min"] * 60_000,
+                )
+                self.refresh_status()
+
+        dialog.connect("closed", on_close)
+        dialog.present(self)
+
+    def open_sunshine_credentials(self):
+        if not HAVE_SECRET:
+            self._error(
+                "GNOME Keyring support isn't installed yet. Run:\n\n"
+                "sudo apt install gir1.2-secret-1\n\n"
+                "then restart Magic.",
+                heading="Keyring unavailable",
+            )
+            return
+
+        dialog = Adw.Dialog(title="Sunshine Credentials")
+        dialog.set_content_width(380)
+        toolbar_view = Adw.ToolbarView()
+        dialog.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        page = Adw.PreferencesPage()
+        toolbar_view.set_content(page)
+        group = Adw.PreferencesGroup(
+            description="Used to call Sunshine's local pairing API at "
+            f"https://{self.state['sunshine_host']}:{self.state['sunshine_port']}. "
+            "Change the host/port in Preferences. Stored in GNOME Keyring."
+        )
+        page.add(group)
+
+        existing = get_sunshine_credentials()
+        username_row = Adw.EntryRow(title="Username")
+        if existing:
+            username_row.set_text(existing[0])
+        group.add(username_row)
+
+        password_row = Adw.PasswordEntryRow(title="Password")
+        if existing:
+            password_row.set_text(existing[1])
+        group.add(password_row)
+
+        save_button = Gtk.Button(label="Save", css_classes=["suggested-action"], margin_top=4)
+        group.add(save_button)
+
+        def on_save(_button):
+            ok = set_sunshine_credentials(username_row.get_text(), password_row.get_text())
+            dialog.close()
+            if ok:
+                self.notify_system("Magic", "Sunshine credentials saved.")
+            else:
+                self._error("Could not save to GNOME Keyring.", heading="Save failed")
+
+        save_button.connect("clicked", on_save)
+        dialog.present(self)
+
+    def open_help(self):
+        dialog = Adw.Dialog(title="Help")
+        dialog.set_content_width(460)
+        dialog.set_content_height(640)
+        toolbar_view = Adw.ToolbarView()
+        dialog.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+
+        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        toolbar_view.set_content(scroller)
+        page = Adw.PreferencesPage()
+        scroller.set_child(page)
+
+        sections = [
+            (
+                "What Magic Does",
+                "Magic switches this PC between two power states so you can "
+                "remote into it with Moonlight over Tailscale while away, "
+                "without leaving it permanently vulnerable to never sleeping "
+                "when you're home.",
+            ),
+            (
+                "Built For This Machine",
+                "PikaOS running the COSMIC desktop (Wayland), reached "
+                "remotely over Tailscale via Sunshine (game-stream host) "
+                "and Moonlight (client). Wake-on-LAN only works over the "
+                "wired eno1 interface — the Wi-Fi adapter doesn't support "
+                "WoWLAN on this board, so Away Mode requires Ethernet, not "
+                "Wi-Fi.",
+            ),
+            (
+                "Home Mode",
+                "Normal behavior: the screen locks and the system suspends "
+                "after the idle timeouts you set in Preferences, and "
+                "Wake-on-LAN is off even if the Ethernet cable is plugged in.",
+            ),
+            (
+                "Away Mode",
+                "Sleep, suspend, hibernate, and screen lock are all disabled "
+                "so the box stays fully powered on — that's what keeps "
+                "Tailscale and Sunshine reachable while you're out. "
+                "Wake-on-LAN is armed on eno1 as a fallback in case the "
+                "machine ever loses power outright. Requires Ethernet to be "
+                "connected to turn on. If the cable is later unplugged while "
+                "Away Mode is active, Magic switches back to Home Mode "
+                "automatically and sends a notification — but only while "
+                "this window is open; it does nothing in the background "
+                "when closed.",
+            ),
+            (
+                "Sleep / Lock Timing",
+                "Menu → Preferences sets how many minutes of inactivity in "
+                "Home Mode before the screen locks and before the system "
+                "suspends. These write to the exact same COSMIC config file "
+                "the System Settings → Power panel uses, so the two never "
+                "disagree with each other.",
+            ),
+            (
+                "Sunshine Pairing",
+                "When Moonlight shows a 4-digit PIN on a new device, type "
+                "that PIN plus a name for the device into the Device Name / "
+                "PIN fields on the main window and press Pair Device — no "
+                "need to open Sunshine's own web page yourself. The device "
+                "name field remembers the last one you used.",
+            ),
+            (
+                "Local Host Setting",
+                "Menu → Preferences → Sunshine API sets the host and port "
+                "Magic talks to. It defaults to Sunshine's standard local "
+                "address — only change this if you've moved Sunshine's web "
+                "port.",
+            ),
+            (
+                "Sunshine Credentials",
+                "Menu → Sunshine Credentials sets the same username/password "
+                "you use to log into Sunshine's web UI. Required once before "
+                "pairing works — stored in GNOME Keyring, not in a plain "
+                "file.",
+            ),
+            (
+                "Elevated Actions",
+                "Toggling modes changes system-wide sleep targets and the "
+                "Ethernet Wake-on-LAN flag via a small, fixed root helper "
+                "script. A one-time setup step grants your user "
+                "passwordless sudo for that exact script only — no "
+                "password prompt on every toggle, and no path through "
+                "cosmic-osd's polkit agent (which has a bug that can "
+                "dismiss authentication requests on this system).",
+            ),
+            (
+                "Uninstalling",
+                "Menu → Uninstall Magic reverts sleep/lock/WoL to normal and "
+                "removes all of Magic's files, including saved credentials.",
+            ),
+        ]
+        for title, body in sections:
+            group = Adw.PreferencesGroup(title=title, description=body)
+            page.add(group)
+
+        dialog.present(self)
+
+
+class MagicApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.create_action("uninstall", self._on_uninstall)
+        self.create_action("about", self._on_about)
+        self.create_action("preferences", lambda *_a: self.props.active_window.open_preferences())
+        self.create_action(
+            "sunshine_credentials",
+            lambda *_a: self.props.active_window.open_sunshine_credentials(),
+        )
+        self.create_action("help", lambda *_a: self.props.active_window.open_help())
+
+    def create_action(self, name, callback):
+        action = Gio.SimpleAction.new(name, None)
+        action.connect("activate", callback)
+        self.add_action(action)
+
+    def do_activate(self):
+        win = self.props.active_window or MagicWindow(self)
+        win.present()
+
+    def _on_uninstall(self, *_args):
+        win = self.props.active_window
+        dialog = Adw.MessageDialog(
+            transient_for=win,
+            heading="Uninstall Magic?",
+            body=(
+                "This restores normal sleep/lock behavior, disarms "
+                "Wake-on-LAN, and removes Magic's files, including the "
+                "privileged helper and saved Sunshine credentials. This "
+                "cannot be undone."
+            ),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("uninstall", "Uninstall")
+        dialog.set_response_appearance("uninstall", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response):
+            if response == "uninstall":
+                subprocess.Popen(
+                    ["/bin/bash", GLib.get_home_dir() + "/.local/bin/magic-uninstall"]
+                )
+                self.quit()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def _on_about(self, *_args):
+        about = Adw.AboutWindow(
+            transient_for=self.props.active_window,
+            application_name="Magic",
+            application_icon="magic",
+            version="3.0",
+            comments="Toggle Away/Home power state for remote desktop access over Tailscale.",
+        )
+        about.present()
+
+
+if __name__ == "__main__":
+    import sys
+
+    app = MagicApp()
+    sys.exit(app.run(sys.argv))

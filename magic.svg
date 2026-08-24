@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="wand" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#4c2f8a"/>
+      <stop offset="100%" stop-color="#9163f2"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffe08a"/>
+      <stop offset="100%" stop-color="#ff9f43"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="80" width="70" height="13" rx="6.5" fill="url(#wand)" transform="rotate(-45 59 86)"/>
+  <circle cx="34" cy="76" r="4.5" fill="#2c1c56"/>
+  <g fill="url(#spark)">
+    <path d="M94 18 L100.5 33 L115.5 39.5 L100.5 46 L94 61 L87.5 46 L72.5 39.5 L87.5 33 Z"/>
+  </g>
+  <g fill="#ffd36e">
+    <path d="M38 26 L41.5 34 L49.5 37.5 L41.5 41 L38 49 L34.5 41 L26.5 37.5 L34.5 34 Z"/>
+    <circle cx="22" cy="64" r="4.5"/>
+  </g>
+</svg>
