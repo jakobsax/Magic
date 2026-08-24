@@ -10,6 +10,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_USER="$(id -un)"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
@@ -28,8 +29,8 @@ case "${XDG_CURRENT_DESKTOP:-}${DESKTOP_SESSION:-}" in
         ;;
 esac
 
-if ! sudo -v 2>/dev/null; then
-    echo "  Error: '$USER' cannot sudo on this machine. install.sh needs sudo for" >&2
+if ! sudo -n true 2>/dev/null && ! sudo -v; then
+    echo "  Error: '$TARGET_USER' cannot sudo on this machine. install.sh needs sudo for" >&2
     echo "  two steps (installing the root helper and its sudoers rule) — add" >&2
     echo "  this user to the sudo/wheel group first, then re-run." >&2
     exit 1
@@ -37,17 +38,22 @@ fi
 
 echo "== Checking dependencies =="
 missing=()
-python3 -c "import gi" 2>/dev/null || missing+=("python3-gi")
-python3 -c "import gi; gi.require_version('Gtk','4.0')" 2>/dev/null \
-    || missing+=("gir1.2-gtk-4.0")
-python3 -c "import gi; gi.require_version('Adw','1')" 2>/dev/null \
-    || missing+=("gir1.2-adw-1")
+if python3 -c "import gi" 2>/dev/null; then
+    python3 -c "import gi; gi.require_version('Gtk','4.0')" 2>/dev/null \
+        || missing+=("gir1.2-gtk-4.0")
+    python3 -c "import gi; gi.require_version('Adw','1')" 2>/dev/null \
+        || missing+=("gir1.2-adw-1")
+    python3 -c "import gi; gi.require_version('Secret','1')" 2>/dev/null \
+        || echo "  Note: gir1.2-secret-1 not found — Sunshine pairing/keyring features will" \
+                "be disabled until you 'sudo apt install gir1.2-secret-1' (everything else works)."
+else
+    missing+=("python3-gi")
+    echo "  Note: can't check for gir1.2-gtk-4.0/gir1.2-adw-1/gir1.2-secret-1 until" \
+            "python3-gi is installed — re-run this script after installing it."
+fi
 command -v nmcli >/dev/null || missing+=("network-manager")
 command -v ethtool >/dev/null || missing+=("ethtool")
 command -v systemctl >/dev/null || missing+=("systemd")
-python3 -c "import gi; gi.require_version('Secret','1')" 2>/dev/null \
-    || echo "  Note: gir1.2-secret-1 not found — Sunshine pairing/keyring features will be" \
-            "disabled until you 'sudo apt install gir1.2-secret-1' (everything else works)."
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "Missing required packages (Debian/Ubuntu apt names):"
     printf '  - %s\n' "${missing[@]}"
@@ -81,7 +87,7 @@ sudo install -Dm755 "$SCRIPT_DIR/magic-helper" "$HELPER"
 echo "== Installing a scoped passwordless sudo rule for that exact helper (requires sudo) =="
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
-echo "$USER ALL=(root) NOPASSWD: $HELPER" > "$TMP"
+echo "$TARGET_USER ALL=(root) NOPASSWD: $HELPER" > "$TMP"
 if ! sudo visudo -c -f "$TMP" >/dev/null; then
     echo "Refusing to install: generated sudoers rule failed validation." >&2
     exit 1
