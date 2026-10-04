@@ -842,7 +842,7 @@ class MagicApp(Adw.Application):
             transient_for=self.props.active_window,
             application_name="Magic",
             application_icon="magic",
-            version="3.0",
+            version="2.1",
             comments="Toggle Away/Home power state for remote desktop access over Tailscale.",
         )
         about.present()
