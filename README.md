@@ -1,4 +1,4 @@
-# Magic
+# Magic :magic_wand:
 
 A small GTK4/libadwaita desktop app that toggles a Linux desktop between two
 power states — **Home** (normal sleep/lock) and **Away** (stays fully awake,
