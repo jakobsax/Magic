@@ -34,8 +34,14 @@ case "${1:-}" in
         apply_wol default
         rm -f /usr/local/libexec/magic-helper
         ;;
+    tailscale-up)
+        tailscale up
+        ;;
+    tailscale-down)
+        tailscale down
+        ;;
     *)
-        echo "Usage: magic-helper {away|home|uninstall}" >&2
+        echo "Usage: magic-helper {away|home|uninstall|tailscale-up|tailscale-down}" >&2
         exit 1
         ;;
 esac

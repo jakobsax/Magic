@@ -234,6 +234,8 @@ class MagicWindow(Adw.ApplicationWindow):
         self.set_default_size(440, 780)
         self._syncing = False
         self._applying = False
+        self._ts_syncing = False
+        self._ts_applying = False
         self.state = load_state()
 
         toolbar_view = Adw.ToolbarView()
@@ -292,6 +294,10 @@ class MagicWindow(Adw.ApplicationWindow):
             row.add_suffix(row.value_label)
             self.status_group.add(row)
 
+        self.ts_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.ts_switch.connect("notify::active", self._on_ts_switch_toggled)
+        self.row_ts.add_suffix(self.ts_switch)
+
         pair_group = Adw.PreferencesGroup(
             title="Sunshine Pairing",
             description="Enter the PIN Moonlight shows on the new device.",
@@ -343,6 +349,38 @@ class MagicWindow(Adw.ApplicationWindow):
                         state["home_suspend_min"] * 60_000,
                     )
             GLib.idle_add(on_done, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_ts_switch_silently(self, value: bool):
+        self._ts_syncing = True
+        self.ts_switch.set_active(value)
+        self._ts_syncing = False
+
+    def _on_ts_switch_toggled(self, switch, _pspec):
+        if self._ts_syncing or self._ts_applying:
+            return
+        up = switch.get_active()
+        self._ts_applying = True
+        self.ts_switch.set_sensitive(False)
+
+        def worker():
+            action = "tailscale-up" if up else "tailscale-down"
+            r = run(["sudo", "-n", HELPER, action], timeout=15)
+            error = None
+            if r.returncode != 0:
+                error = RuntimeError(r.stderr.strip() or f"sudo -n failed running {action}")
+            GLib.idle_add(done, error)
+
+        def done(error):
+            self._ts_applying = False
+            self.ts_switch.set_sensitive(True)
+            if error is not None:
+                self._set_ts_switch_silently(not up)
+                self._error(str(error), heading="Tailscale couldn't be toggled")
+                return False
+            self.refresh_status()
+            return False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -485,7 +523,10 @@ class MagicWindow(Adw.ApplicationWindow):
         self.row_sleep.value_label.set_label(
             "Disabled (Away Mode)" if is_away_mode() else idle_status_text()
         )
-        self.row_ts.value_label.set_label(tailscale_state())
+        ts_text = tailscale_state()
+        self.row_ts.value_label.set_label(ts_text)
+        if not self._ts_applying:
+            self._set_ts_switch_silently(ts_text == "Connected")
 
     # -- Sunshine pairing -----------------------------------------------------
 
